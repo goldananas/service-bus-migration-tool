@@ -22,5 +22,9 @@ artifacts/
 ## User-specific config (contains connection strings)
 appsettings.local.json
 
+## Migration runtime files
+migration-state.json
+logs/
+
 ## AI
 .claude/settings.local.json
