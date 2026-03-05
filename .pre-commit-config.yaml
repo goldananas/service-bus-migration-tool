@@ -1,0 +1,14 @@
+repos:
+  - repo: local
+    hooks:
+      - id: no-connection-strings
+        name: Check for Service Bus connection strings
+        language: system
+        types: [text]
+        stages: [pre-commit]
+        exclude: ^(README\.md|CLAUDE\.md)$
+        entry: >-
+          bash -c 'if grep -Hn "Endpoint=sb:""//""" "$@"; then
+          echo "";
+          echo "ERROR: File(s) contain a Service Bus connection string.";
+          exit 1; fi' --
