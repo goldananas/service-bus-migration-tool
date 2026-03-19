@@ -113,10 +113,13 @@ public class MessageCopier : IAsyncDisposable
                 }
                 else
                 {
-                    _logger.LogDebug("Sending batch of {BatchCount} messages (seq {FirstSeq}..{LastSeq}) to '{Destination}'",
-                        count, firstSeq, lastSeq, _settings.Destination.EntityName);
+                    // Group by PartitionKey/SessionId to avoid InvalidOperationException on partitioned entities
+                    var groups = batch.GroupBy(m => m.PartitionKey ?? m.SessionId ?? string.Empty);
+                    foreach (var group in groups)
+                    {
+                        await sender!.SendMessagesAsync(group.ToList(), cancellationToken);
+                    }
 
-                    await sender!.SendMessagesAsync(batch, cancellationToken);
                     subQueueCopied += count;
                     copied += count;
                     _stateManager?.UpdateAfterBatch(entityKey, subQueue, fromSequence, count);
