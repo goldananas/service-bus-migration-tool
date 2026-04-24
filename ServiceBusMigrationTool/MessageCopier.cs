@@ -50,7 +50,11 @@ public class MessageCopier : IAsyncDisposable
 
         int copied = 0;
 
-        foreach (var subQueue in new[] { SubQueue.None, SubQueue.DeadLetter })
+        var subQueues = _settings.DlqOnly
+            ? new[] { SubQueue.DeadLetter }
+            : new[] { SubQueue.None, SubQueue.DeadLetter };
+
+        foreach (var subQueue in subQueues)
         {
             var receiverOptions = new ServiceBusReceiverOptions
             {
@@ -87,6 +91,8 @@ public class MessageCopier : IAsyncDisposable
 
                 foreach (var msg in peeked)
                 {
+                    fromSequence = msg.SequenceNumber + 1;
+
                     var clone = new ServiceBusMessage(msg);
 
                     // Generate new MessageId to avoid duplicate detection silently dropping messages.
@@ -96,7 +102,6 @@ public class MessageCopier : IAsyncDisposable
                     clone.MessageId = Guid.NewGuid().ToString();
 
                     batch.Add(clone);
-                    fromSequence = msg.SequenceNumber + 1;
 
                     _logger.LogDebug("  Peek: seq={SequenceNumber}, msgId={MessageId}, contentType={ContentType}, bodySize={BodySize}",
                         msg.SequenceNumber, msg.MessageId, msg.ContentType ?? "(none)", msg.Body?.ToMemory().Length ?? 0);
@@ -113,12 +118,8 @@ public class MessageCopier : IAsyncDisposable
                 }
                 else
                 {
-                    // Group by PartitionKey/SessionId to avoid InvalidOperationException on partitioned entities
-                    var groups = batch.GroupBy(m => m.PartitionKey ?? m.SessionId ?? string.Empty);
-                    foreach (var group in groups)
-                    {
-                        await sender!.SendMessagesAsync(group.ToList(), cancellationToken);
-                    }
+                    int skipped = await SendBatchWithFallback(sender!, batch, sourceLabel, cancellationToken);
+                    count -= skipped;
 
                     subQueueCopied += count;
                     copied += count;
@@ -150,6 +151,48 @@ public class MessageCopier : IAsyncDisposable
             await sender.DisposeAsync();
 
         return copied;
+    }
+
+    private async Task<int> SendBatchWithFallback(
+        ServiceBusSender sender, List<ServiceBusMessage> batch, string sourceLabel, CancellationToken cancellationToken)
+    {
+        // Group by PartitionKey/SessionId to avoid InvalidOperationException on partitioned entities
+        var groups = batch.GroupBy(m => m.PartitionKey ?? m.SessionId ?? string.Empty);
+        int skipped = 0;
+
+        foreach (var group in groups)
+        {
+            var messages = group.ToList();
+            try
+            {
+                await sender.SendMessagesAsync(messages, cancellationToken);
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("no data in it") && messages.Count > 1)
+            {
+                _logger.LogWarning("Batch send failed for group from '{Source}', falling back to individual sends", sourceLabel);
+                foreach (var msg in messages)
+                {
+                    try
+                    {
+                        await sender.SendMessagesAsync([msg], cancellationToken);
+                    }
+                    catch (InvalidOperationException ex2) when (ex2.Message.Contains("no data in it"))
+                    {
+                        _logger.LogWarning("Skipping unsendable message (msgId={MessageId}) from '{Source}': {Error}",
+                            msg.MessageId, sourceLabel, ex2.Message);
+                        skipped++;
+                    }
+                }
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("no data in it") && messages.Count == 1)
+            {
+                _logger.LogWarning("Skipping unsendable message (msgId={MessageId}) from '{Source}': {Error}",
+                    messages[0].MessageId, sourceLabel, ex.Message);
+                skipped++;
+            }
+        }
+
+        return skipped;
     }
 
     private async Task<long?> GetDestinationMessageCountAsync(CancellationToken cancellationToken)

@@ -56,16 +56,38 @@ public class NamespaceMigrator
                 continue;
             }
 
+            var queueProps = await sourceAdmin.GetQueueAsync(queue.Name, cancellationToken);
+            if (!string.IsNullOrEmpty(queueProps.Value.ForwardTo))
+            {
+                if (queue.DeadLetterMessageCount > 0)
+                {
+                    _logger.LogInformation("  Queue '{QueueName}': {ActiveCount} active, {DlqCount} DLQ — auto-forwarding, DLQ only",
+                        queue.Name, queue.ActiveMessageCount, queue.DeadLetterMessageCount);
+                }
+                else
+                {
+                    _logger.LogInformation("  Queue '{QueueName}': auto-forwarding to '{ForwardTo}', no DLQ messages — skipped",
+                        queue.Name, queueProps.Value.ForwardTo);
+                    allEntities.Add(new(queue.Name, queue.ActiveMessageCount, queue.DeadLetterMessageCount, "AUTO-FORWARD (empty DLQ)"));
+                    continue;
+                }
+            }
+
+            bool isAutoForward = !string.IsNullOrEmpty(queueProps.Value.ForwardTo);
+
             if (!await destValidator.QueueExistsAsync(queue.Name, cancellationToken))
             {
                 allEntities.Add(new(queue.Name, queue.ActiveMessageCount, queue.DeadLetterMessageCount, "NO DEST"));
                 continue;
             }
 
-            operations.Add(BuildQueueOperation(queue.Name));
-            allEntities.Add(new(queue.Name, queue.ActiveMessageCount, queue.DeadLetterMessageCount, null));
-            _logger.LogInformation("  Queue '{QueueName}': {ActiveCount} active, {DlqCount} DLQ",
-                queue.Name, queue.ActiveMessageCount, queue.DeadLetterMessageCount);
+            var queueOp = BuildQueueOperation(queue.Name);
+            queueOp.DlqOnly = isAutoForward;
+            operations.Add(queueOp);
+            allEntities.Add(new(queue.Name, queue.ActiveMessageCount, queue.DeadLetterMessageCount, isAutoForward ? "DLQ ONLY" : null));
+            if (!isAutoForward)
+                _logger.LogInformation("  Queue '{QueueName}': {ActiveCount} active, {DlqCount} DLQ",
+                    queue.Name, queue.ActiveMessageCount, queue.DeadLetterMessageCount);
         }
 
         _logger.LogInformation("Discovering topics and subscriptions...");
@@ -104,16 +126,36 @@ public class NamespaceMigrator
                     continue;
                 }
 
+                var subProps = await sourceAdmin.GetSubscriptionAsync(topic.Name, sub.SubscriptionName, cancellationToken);
+                bool isAutoForward = !string.IsNullOrEmpty(subProps.Value.ForwardTo);
+
+                if (isAutoForward && sub.DeadLetterMessageCount == 0)
+                {
+                    _logger.LogInformation("  Subscription '{EntityPath}': auto-forwarding to '{ForwardTo}', no DLQ messages — skipped",
+                        entityPath, subProps.Value.ForwardTo);
+                    allEntities.Add(new(entityPath, sub.ActiveMessageCount, sub.DeadLetterMessageCount, "AUTO-FORWARD (empty DLQ)"));
+                    continue;
+                }
+
+                if (isAutoForward)
+                {
+                    _logger.LogInformation("  Subscription '{EntityPath}': {ActiveCount} active, {DlqCount} DLQ — auto-forwarding, DLQ only",
+                        entityPath, sub.ActiveMessageCount, sub.DeadLetterMessageCount);
+                }
+
                 if (!await destValidator.SubscriptionExistsAsync(topic.Name, sub.SubscriptionName, cancellationToken))
                 {
                     allEntities.Add(new(entityPath, sub.ActiveMessageCount, sub.DeadLetterMessageCount, "NO DEST"));
                     continue;
                 }
 
-                operations.Add(BuildTopicOperation(topic.Name, sub.SubscriptionName));
-                allEntities.Add(new(entityPath, sub.ActiveMessageCount, sub.DeadLetterMessageCount, null));
-                _logger.LogInformation("  Subscription '{EntityPath}': {ActiveCount} active, {DlqCount} DLQ",
-                    entityPath, sub.ActiveMessageCount, sub.DeadLetterMessageCount);
+                var subOp = BuildTopicOperation(topic.Name, sub.SubscriptionName);
+                subOp.DlqOnly = isAutoForward;
+                operations.Add(subOp);
+                allEntities.Add(new(entityPath, sub.ActiveMessageCount, sub.DeadLetterMessageCount, isAutoForward ? "DLQ ONLY" : null));
+                if (!isAutoForward)
+                    _logger.LogInformation("  Subscription '{EntityPath}': {ActiveCount} active, {DlqCount} DLQ",
+                        entityPath, sub.ActiveMessageCount, sub.DeadLetterMessageCount);
             }
         }
 
@@ -126,6 +168,7 @@ public class NamespaceMigrator
         if (operations.Count == 0)
         {
             _logger.LogInformation("No copyable entities found (all empty, excluded, or missing destination)");
+            await PrintVerificationAsync(sourceAdmin, allEntities, cancellationToken);
             return 0;
         }
 
@@ -169,6 +212,8 @@ public class NamespaceMigrator
         }
         _logger.LogInformation("Total: {TotalCopied} message(s) sent, {Failed} operation(s) failed",
             totalCopied, failed);
+
+        await PrintVerificationAsync(sourceAdmin, allEntities, cancellationToken);
 
         return totalCopied;
     }
@@ -267,4 +312,87 @@ public class NamespaceMigrator
             TopicName = topicName
         }
     };
+
+    private async Task PrintVerificationAsync(
+        ServiceBusAdministrationClient sourceAdmin, List<DiscoveredEntity> allEntities, CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("");
+        _logger.LogInformation("=== Verification: Source vs Destination ===");
+        _logger.LogInformation("");
+
+        var destAdmin = new ServiceBusAdministrationClient(_config.DestinationConnectionString);
+
+        var destQueueCounts = new Dictionary<string, (long Active, long Dlq)>(StringComparer.OrdinalIgnoreCase);
+        await foreach (var q in destAdmin.GetQueuesRuntimePropertiesAsync(cancellationToken))
+            destQueueCounts[q.Name] = (q.ActiveMessageCount, q.DeadLetterMessageCount);
+
+        var destSubCounts = new Dictionary<string, (long Active, long Dlq)>(StringComparer.OrdinalIgnoreCase);
+        await foreach (var topic in destAdmin.GetTopicsAsync(cancellationToken))
+        {
+            await foreach (var sub in destAdmin.GetSubscriptionsRuntimePropertiesAsync(topic.Name, cancellationToken))
+            {
+                var key = $"{topic.Name}/Subscriptions/{sub.SubscriptionName}";
+                destSubCounts[key] = (sub.ActiveMessageCount, sub.DeadLetterMessageCount);
+            }
+        }
+
+        int matched = 0;
+        int mismatched = 0;
+
+        foreach (var entity in allEntities.OrderByDescending(e => e.Active + e.Dlq))
+        {
+            var srcTotal = entity.Active + entity.Dlq;
+
+            if (entity.SkipReason is "NO DEST" or "NO DEST (topic)" or "AUTO-FORWARD (empty DLQ)")
+                continue;
+
+            bool isSubscription = entity.Name.Contains("/Subscriptions/");
+            long destTotal = 0;
+            string note = "";
+
+            if (isSubscription)
+            {
+                if (destSubCounts.TryGetValue(entity.Name, out var destSub))
+                    destTotal = destSub.Active + destSub.Dlq;
+                else
+                    note = "NOT FOUND AT DEST";
+            }
+            else
+            {
+                if (destQueueCounts.TryGetValue(entity.Name, out var destQueue))
+                    destTotal = destQueue.Active + destQueue.Dlq;
+                else
+                    note = "NOT FOUND AT DEST";
+            }
+
+            if (entity.SkipReason is "EMPTY" or "EXCLUDED")
+                note = entity.SkipReason;
+
+            var delta = destTotal - srcTotal;
+            var deltaStr = delta switch
+            {
+                > 0 => $"+{delta}",
+                < 0 => delta.ToString(),
+                _ => "0"
+            };
+            var suffix = note != "" ? $" ({note})" : "";
+            var status = delta == 0 ? "OK" : "MISMATCH";
+
+            if (delta != 0)
+            {
+                _logger.LogWarning("  [{Status}] {Name}: src={Src} dest={Dest} delta={Delta}{Note}",
+                    status, entity.Name, srcTotal, destTotal, deltaStr, suffix);
+                mismatched++;
+            }
+            else
+            {
+                _logger.LogInformation("  [{Status}] {Name}: src={Src} dest={Dest}{Note}",
+                    status, entity.Name, srcTotal, destTotal, suffix);
+                matched++;
+            }
+        }
+
+        _logger.LogInformation("");
+        _logger.LogInformation("Verification: {Matched} matched, {Mismatched} mismatched", matched, mismatched);
+    }
 }
